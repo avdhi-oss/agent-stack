@@ -1,0 +1,290 @@
+= LLM Agent Stack — Reference Architecture
+Platform Engineering <platform@example.com>
+v0.3, 2026-07-21
+:doctype: book
+:toc: left
+:toclevels: 3
+:sectnums:
+:sectanchors:
+:sectlinks:
+:icons: font
+:source-highlighter: highlight.js
+:experimental:
+:doc-id: HLD-AGT-001
+:doc-status: DRAFT
+:imagesdir: images
+
+[.lead]
+Reference architecture for a production LLM agent stack: layers, component
+responsibilities, failure modes, and technology selections with provenance.
+
+[NOTE]
+====
+*Document ID:* {doc-id} · *Status:* {doc-status} · *Owner:* Platform Engineering ·
+*Review cadence:* Quarterly
+
+Provenance tags used in this document: `[SRC:vendor-doc]`, `[SRC:internal-poc]`,
+`[SRC:inference]` — every design decision cites one.
+====
+
+== Purpose and Scope
+
+[[agt-purpose]]
+=== Purpose
+
+This document defines the canonical layering of the agent platform so that
+teams building agentic features share vocabulary, module boundaries, and a
+common list of known failure modes. It is a High-Level Design (HLD); per-agent
+Low-Level Designs (LLDs) hang off <<agt-layers,Section 3>> component IDs.
+
+[[agt-scope]]
+=== Scope
+
+.In scope
+* Runtime layering: model gateway, orchestration, tools, memory, guardrails, observability
+* Durable execution and human-in-the-loop approval gates
+* Failure-mode-first analysis per layer
+
+.Out of scope
+* Model training / fine-tuning pipelines
+* Prompt content standards (see `DOC-PRM-002`)
+* Cost governance policy (see `DOC-FIN-014`)
+
+== Architecture Overview
+
+[[agt-overview]]
+The stack is six layers. Requests flow top-down; telemetry flows bottom-up.
+
+[source]
+----
+┌─────────────────────────────────────────────┐
+│  L6  Experience      (chat UI, APIs, hooks) │
+├─────────────────────────────────────────────┤
+│  L5  Guardrails      (input/output policy)  │
+├─────────────────────────────────────────────┤
+│  L4  Orchestration   (planner, DAG, HITL)   │
+├─────────────────────────────────────────────┤
+│  L3  Tools & Skills  (MCP servers, sandbox) │
+├─────────────────────────────────────────────┤
+│  L2  Memory & State  (vector, KV, episodic) │
+├─────────────────────────────────────────────┤
+│  L1  Model Gateway   (routing, fallback)    │
+└─────────────────────────────────────────────┘
+        └──── L0  Observability (cross-cutting)
+----
+
+[IMPORTANT]
+====
+The orchestrator (L4) is the *only* layer permitted to invoke tools (L3).
+Direct model→tool coupling is prohibited: it bypasses approval gates and
+makes replay impossible. `[SRC:internal-poc]`
+====
+
+== Layer Specifications
+
+[[agt-layers]]
+
+[[agt-l1]]
+=== L1 — Model Gateway
+
+[cols="1,3", options="header"]
+|===
+| Attribute | Value
+
+| Component ID
+| `AGT-L1-GW`
+
+| Responsibility
+| Single egress point for all LLM calls: provider routing, retry/fallback,
+  token accounting, response caching.
+
+| Primary tech
+| LiteLLM-style proxy behind an internal REST facade `[SRC:internal-poc]`
+
+| SLO
+| p99 added latency < 120 ms (excluding provider time)
+|===
+
+.Failure modes (analyse these first)
+[cols="2,2,3", options="header"]
+|===
+| Failure | Blast radius | Mitigation
+
+| Provider outage
+| All agents stall
+| Multi-provider fallback chain; circuit breaker with 30 s half-open probe
+
+| Silent model version drift
+| Behavioural regressions, eval gaps
+| Pin model versions in config; alert on provider-side version change
+
+| Token cost runaway
+| Budget breach within hours
+| Per-agent daily token budget enforced at the gateway, hard-fail at 110 %
+|===
+
+[[agt-l2]]
+=== L2 — Memory & State
+
+Three distinct stores; conflating them is the most common design error
+observed in internal POCs. `[SRC:internal-poc]`
+
+[horizontal]
+Working memory:: Conversation window + scratchpad. Lives in the orchestration
+  run record. Ephemeral, replayable.
+Episodic memory:: Summaries of past runs, keyed by user/agent. PostgreSQL
+  with `pgvector` for similarity recall.
+Semantic memory:: Curated org knowledge. Ingest pipeline with provenance
+  metadata on every chunk; retrieval must return source IDs.
+
+[WARNING]
+====
+Retrieval without provenance IDs is banned. If the retriever cannot say
+*where* a chunk came from, the guardrails layer (L5) cannot audit the answer.
+====
+
+[[agt-l3]]
+=== L3 — Tools & Skills
+
+* All tools are exposed as MCP servers; no bespoke tool-calling shims. `[SRC:vendor-doc]`
+* Side-effectful tools declare an `impact` field (`read`, `write`, `irreversible`).
+* `irreversible` tools *must* route through an L4 approval gate — no exceptions.
+* Code execution runs in a sandbox with an explicit egress allowlist.
+
+[source,json]
+----
+{
+  "tool": "disbursement.initiate",
+  "impact": "irreversible",
+  "approval_gate": "HITL-FIN-01",
+  "timeout_s": 30,
+  "idempotency_key_required": true
+}
+----
+
+[[agt-l4]]
+=== L4 — Orchestration
+
+The planner emits a DAG of steps; a durable workflow engine executes it.
+
+.Engine selection
+[cols="1,1,3", options="header"]
+|===
+| Option | Verdict | Rationale
+
+| Temporal
+| *Selected*
+| Durable replay, HITL signals as first-class primitives, worker model fits
+  containerised deployment. `[SRC:internal-poc]`
+
+| Hand-rolled state machine + outbox
+| Rejected
+| Rebuilds Temporal's hard 20 % (retries, timers, replay) badly. `[SRC:inference]`
+
+| Flowable BPMN
+| Rejected for agents
+| Strong for human workflow, weak for dynamic DAGs generated at runtime.
+  `[SRC:internal-poc]`
+|===
+
+Approval gates are modelled as workflow signals with a 72-hour timeout and an
+escalation path. A timed-out gate fails the run — it never auto-approves.
+
+[[agt-l5]]
+=== L5 — Guardrails
+
+[cols="1,2,2", options="header"]
+|===
+| Direction | Checks | Action on violation
+
+| Input
+| Prompt-injection heuristics, PII detection, jailbreak patterns
+| Reject with typed error; log to `AGT-L0-SEC` stream
+
+| Output
+| Provenance completeness, PII leakage, tool-plan policy (impact vs. role)
+| Block, redact, or downgrade to human review depending on severity
+|===
+
+[CAUTION]
+====
+Guardrails are a *reduction* layer, not a guarantee. Treat every tool result
+and retrieved document as untrusted input to the model. Design reviews must
+answer: "what happens when the model is successfully injected?" — not
+"how do we prevent injection?" `[SRC:inference]`
+====
+
+[[agt-l6]]
+=== L6 — Experience
+
+* Streaming responses over SSE; degrade to polling when infra disallows sticky connections.
+* Every user-visible answer carries citation chips resolved from L2 provenance IDs.
+* Agent actions surface as an auditable timeline, not a chat transcript alone.
+
+[[agt-l0]]
+=== L0 — Observability (cross-cutting)
+
+. Every run gets a `run_id`; every step a `span_id` (OpenTelemetry).
+. Full prompt/response capture with PII redaction at write time.
+. Eval harness replays sampled production runs nightly against pinned models;
+  regression > 2 % on the golden set pages the owning team.
+
+== Decision Log
+
+[[agt-decisions]]
+
+[cols="1,3,1,1", options="header"]
+|===
+| ID | Decision | Status | Provenance
+
+| ADR-AGT-001
+| All LLM egress through a single gateway (L1)
+| Accepted
+| `[SRC:internal-poc]`
+
+| ADR-AGT-002
+| Temporal as the durable execution engine
+| Accepted
+| `[SRC:internal-poc]`
+
+| ADR-AGT-003
+| MCP as the sole tool protocol
+| Accepted
+| `[SRC:vendor-doc]`
+
+| ADR-AGT-004
+| Vector store: `pgvector` now, re-evaluate at >50 M chunks
+| Provisional
+| `[SRC:inference]`
+|===
+
+== Open Risks
+
+[[agt-risks]]
+
+[cols="1,3,1", options="header"]
+|===
+| Risk ID | Description | Severity
+
+| RSK-AGT-01
+| Prompt injection via retrieved documents remains partially mitigated;
+  guardrails reduce but do not eliminate.
+| High
+
+| RSK-AGT-02
+| Eval golden set covers < 40 % of production intent distribution.
+| Medium
+
+| RSK-AGT-03
+| Multi-agent runs can deadlock on shared approval gates; detection exists,
+  automated resolution does not.
+| Medium
+|===
+
+[appendix]
+== Glossary
+
+HITL:: Human-in-the-loop — a mandatory approval step in an agent run.
+MCP:: Model Context Protocol — standard for exposing tools to models.
+Run record:: Durable, replayable log of one agent execution (plan, steps, IO).
+Golden set:: Curated eval cases with expected outputs, versioned with the doc.
